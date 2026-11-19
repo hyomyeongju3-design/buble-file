@@ -3,7 +3,7 @@ diff --git a/server/rooms.js b/server/rooms.js
 index 9eaca40..12dabc6 100644
 --- a/server/rooms.js
 +++ b/server/rooms.js
-@@ -61,12 +61,58 @@ function advance(room,now){
+@@ -61,12 +61,48 @@ function advance(room,now){
      }
      w.updatePlaying(ONLINE_MOVE_STEP);
    }
@@ -14,13 +14,6 @@ index 9eaca40..12dabc6 100644
 -    if(room.rankCode&&winner?.isPlayer&&room.wave<room.waves)startLeagueBattle(room,room.stage,room.wave+1,now);
 +  room.tickAt=since+ticks*dt;
 +  finishRoomTick(room,w,now);
-+}
-+const LEAGUE_FRAME_LIMIT=180;
-+const LEAGUE_FRAME_ALPHABET='0123456789ABCDEFGHIJKLMNOPQRSTUV';
-+const LEAGUE_FRAME_DIRECTIONS=['','U','D','L','R'];
-+function decodeLeagueFrame(frame){
-+  const code=LEAGUE_FRAME_ALPHABET.indexOf(frame);
-+  return {direction:LEAGUE_FRAME_DIRECTIONS[code&7],bomb:!!(code&8),needle:!!(code&16)};
 +}
 +function finishRoomTick(room,world,now){
 +  room.game=world.save();
@@ -64,7 +57,7 @@ index 9eaca40..12dabc6 100644
  }
  function removeMember(room,id){
    room.members=room.members.filter(p=>p.id!==id);
-@@ -79,7 +125,7 @@ function removeMember(room,id){
+@@ -79,7 +115,7 @@ function removeMember(room,id){
  }
  function publicState(room,id,now){
    const result={code:room.code,me:id,host:room.host,phase:room.phase,round:room.round,choices:room.choices,
@@ -73,7 +66,7 @@ index 9eaca40..12dabc6 100644
    if(room.game){
      const {inputs,...game}=room.game,input=inputs[id];
      result.game=game;
-@@ -100,7 +146,7 @@ function applyRoom(room,op,data,secret,now){
+@@ -100,7 +136,7 @@ function applyRoom(room,op,data,secret,now){
    }
    if(!member)fail(403,'방 연결이 끝났어. 다시 입장해 줘.');
    member.lastSeen=now;
@@ -82,7 +75,7 @@ index 9eaca40..12dabc6 100644
    if(op==='leave'){removeMember(room,member.id);return {left:true}}
    if(['settings','start','rematch'].includes(op)&&member.id!==room.host)fail(403,'방장만 진행할 수 있어.');
    if(op==='settings'){
-@@ -119,7 +165,9 @@ function applyRoom(room,op,data,secret,now){
+@@ -119,7 +155,9 @@ function applyRoom(room,op,data,secret,now){
      const w=new SharedArena();w.setupWorld(room.choices,room.members,bots);w.inputs={};room.game=w.save();
      room.phase='play';room.round++;room.startAt=now+2400;room.tickAt=room.startAt;
    }
@@ -93,7 +86,7 @@ index 9eaca40..12dabc6 100644
      const prev=room.game.inputs[member.id];
      if(!prev||data.seq>prev.seq){
        const w=SharedArena.restore(room),ch=w.characters.find(c=>c.id===member.id);
-@@ -160,7 +208,7 @@ async function handleRoom(request,env){
+@@ -160,7 +198,7 @@ async function handleRoom(request,env){
          const code=randomCode(),id=crypto.randomUUID(),member={id,name:'P1',secret,lastSeen:now};
          const room={code,host:id,members:[member],phase:'wait',round:0,startAt:0,choices:cleanChoices(data.choices),game:null};
          if(ranked){
