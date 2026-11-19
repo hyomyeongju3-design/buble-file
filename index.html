@@ -1,226 +1,917 @@
-git apply <<'PATCH'
-diff --git a/server/rooms.js b/server/rooms.js
-index 9eaca40..12dabc6 100644
---- a/server/rooms.js
-+++ b/server/rooms.js
-@@ -61,12 +61,58 @@ function advance(room,now){
-     }
-     w.updatePlaying(ONLINE_MOVE_STEP);
-   }
--  room.tickAt=since+ticks*dt;room.game=w.save();
--  if(w.done){
--    room.phase='end';
--    const winner=w.characters.find(ch=>ch.alive);
--    if(room.rankCode&&winner?.isPlayer&&room.wave<room.waves)startLeagueBattle(room,room.stage,room.wave+1,now);
-+  room.tickAt=since+ticks*dt;
-+  finishRoomTick(room,w,now);
-+}
-+const LEAGUE_FRAME_LIMIT=180;
-+const LEAGUE_FRAME_ALPHABET='0123456789ABCDEFGHIJKLMNOPQRSTUV';
-+const LEAGUE_FRAME_DIRECTIONS=['','U','D','L','R'];
-+function decodeLeagueFrame(frame){
-+  const code=LEAGUE_FRAME_ALPHABET.indexOf(frame);
-+  return {direction:LEAGUE_FRAME_DIRECTIONS[code&7],bomb:!!(code&8),needle:!!(code&16)};
-+}
-+function finishRoomTick(room,world,now){
-+  room.game=world.save();
-+  if(!world.done)return;
-+  room.phase='end';
-+  const winner=world.characters.find(ch=>ch.alive);
-+  if(room.rankCode&&winner?.isPlayer&&room.wave<room.waves)startLeagueBattle(room,room.stage,room.wave+1,now);
-+}
-+function advanceLeagueFrames(room,member,data,now){
-+  if(now<room.startAt||data.round!==room.round)return;
-+  const {moveStart,frames}=data;
-+  if(!Number.isSafeInteger(moveStart)||moveStart<1||typeof frames!=='string'
-+     ||frames.length>LEAGUE_FRAME_LIMIT||!/^[0-9A-V]*$/.test(frames))return;
-+
-+  const applied=room.game.inputs[member.id]?.applied??0;
-+  const offset=applied+1-moveStart;
-+  if(offset<0||offset>=frames.length)return;
-+
-+  const stepMs=1000*ONLINE_MOVE_STEP;
-+  const steps=Math.min(60,frames.length-offset,Math.floor((now-room.tickAt)/stepMs));
-+  if(steps<=0)return;
-+  const world=SharedArena.restore(room),player=world.characters.find(ch=>ch.id===member.id);
-+  if(!player)return;
-+  const input={direction:'',moves:'',applied};
-+  world.inputs[member.id]=input;
-+
-+  // Consume one real simulation tick for every command, including standing still.
-+  // Never advance a ranked match past the player's latest available input.
-+  let processed=0;
-+  for(;processed<steps&&!world.done;processed++){
-+    const frame=decodeLeagueFrame(frames[offset+processed]);
-+    if(frame.bomb)world.placeBomb(player);
-+    if(frame.needle)world.triggerPlayerNeedle(player);
-+    input.moves=frame.direction||'';
-+    world.updatePlaying(ONLINE_MOVE_STEP);
-+    input.applied=applied+processed+1;
-   }
-+  input.moves='';
-+  room.tickAt+=processed*stepMs;
-+  finishRoomTick(room,world,now);
- }
- function removeMember(room,id){
-   room.members=room.members.filter(p=>p.id!==id);
-@@ -79,7 +125,7 @@ function removeMember(room,id){
- }
- function publicState(room,id,now){
-   const result={code:room.code,me:id,host:room.host,phase:room.phase,round:room.round,choices:room.choices,
--    ranked:!!room.rankCode,stage:room.stage,wave:room.wave,waves:room.waves,bots:Math.min(room.choices.bots,4-room.members.length),members:room.members.map(({id,name})=>({id,name})),countdown:Math.max(0,(room.startAt-now)/1000)};
-+    ranked:!!room.rankCode,timedInputs:room.timedInputs===true,stage:room.stage,wave:room.wave,waves:room.waves,bots:Math.min(room.choices.bots,4-room.members.length),members:room.members.map(({id,name})=>({id,name})),countdown:Math.max(0,(room.startAt-now)/1000)};
-   if(room.game){
-     const {inputs,...game}=room.game,input=inputs[id];
-     result.game=game;
-@@ -100,7 +146,7 @@ function applyRoom(room,op,data,secret,now){
-   }
-   if(!member)fail(403,'방 연결이 끝났어. 다시 입장해 줘.');
-   member.lastSeen=now;
--  advance(room,now);
-+  if(!room.timedInputs)advance(room,now);
-   if(op==='leave'){removeMember(room,member.id);return {left:true}}
-   if(['settings','start','rematch'].includes(op)&&member.id!==room.host)fail(403,'방장만 진행할 수 있어.');
-   if(op==='settings'){
-@@ -119,7 +165,9 @@ function applyRoom(room,op,data,secret,now){
-     const w=new SharedArena();w.setupWorld(room.choices,room.members,bots);w.inputs={};room.game=w.save();
-     room.phase='play';room.round++;room.startAt=now+2400;room.tickAt=room.startAt;
-   }
--  if(op==='sync'&&room.phase==='play'&&data.round===room.round&&Number.isSafeInteger(data.seq)&&data.seq>0){
-+  if(op==='sync'&&room.phase==='play'&&room.timedInputs){
-+    advanceLeagueFrames(room,member,data,now);
-+  }else if(op==='sync'&&room.phase==='play'&&data.round===room.round&&Number.isSafeInteger(data.seq)&&data.seq>0){
-     const prev=room.game.inputs[member.id];
-     if(!prev||data.seq>prev.seq){
-       const w=SharedArena.restore(room),ch=w.characters.find(c=>c.id===member.id);
-@@ -160,7 +208,7 @@ async function handleRoom(request,env){
-         const code=randomCode(),id=crypto.randomUUID(),member={id,name:'P1',secret,lastSeen:now};
-         const room={code,host:id,members:[member],phase:'wait',round:0,startAt:0,choices:cleanChoices(data.choices),game:null};
-         if(ranked){
--          room.rankCode=profile.code;startLeagueBattle(room,1,1,now);
-+          room.rankCode=profile.code;room.timedInputs=data.inputVersion===2;startLeagueBattle(room,1,1,now);
-         }
-         const out=await db.prepare('INSERT OR IGNORE INTO arena_rooms (code,revision,expires,payload) VALUES (?,1,?,?)').bind(code,now+ROOM_TTL,JSON.stringify(room)).run();
-         if(out.meta.changes)return json(publicState(room,id,now),201);
-diff --git a/web/engine.js b/web/engine.js
-index f5fc045..15008a5 100644
---- a/web/engine.js
-+++ b/web/engine.js
-@@ -169,6 +169,20 @@ const MOVE_DIRECTIONS = {
-     L: ['left', -1, 0], R: ['right', 1, 0]
- };
- 
-+const LEAGUE_FRAME_LIMIT = 180;
-+const LEAGUE_FRAME_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUV';
-+const LEAGUE_FRAME_DIRECTIONS = ['', 'U', 'D', 'L', 'R'];
-+
-+function encodeLeagueFrame(direction, bomb, needle) {
-+    return LEAGUE_FRAME_ALPHABET[LEAGUE_FRAME_DIRECTIONS.indexOf(direction) |
-+        (bomb ? 8 : 0) | (needle ? 16 : 0)];
-+}
-+
-+function decodeLeagueFrame(frame) {
-+    const code = LEAGUE_FRAME_ALPHABET.indexOf(frame);
-+    return {direction: LEAGUE_FRAME_DIRECTIONS[code & 7], bomb: !!(code & 8), needle: !!(code & 16)};
-+}
-+
- class DuelEngine {
-             stepOnlineMovement(player, key, dt) {
-                 const move = MOVE_DIRECTIONS[key];
-diff --git a/web/rooms.js b/web/rooms.js
-index 1c0e407..3a2699a 100644
---- a/web/rooms.js
-+++ b/web/rooms.js
-@@ -1,17 +1,34 @@
- 'use strict';
- let roomSession=null,roomState=null,roomTimer=0,seq=0,queue=Promise.resolve(),pending={bomb:false,needle:false};
- // Keep a bounded list of unacknowledged movement steps to replay on the local player.
--let queuedMoves='', moveStart=1, moveCarry=0, lastMove='';
-+let queuedMoves='', moveStart=1, moveCarry=0, lastMove='', leagueTap='';
- function resetRoomMovement(received=0){
--  queuedMoves='';moveStart=received+1;moveCarry=0;lastMove='';
-+  queuedMoves='';moveStart=received+1;moveCarry=0;lastMove='';leagueTap='';
- }
- function acknowledgeRoomMovement(applied){
-   const count=Math.max(0,applied-moveStart+1);
-   queuedMoves=queuedMoves.slice(count);
-   moveStart+=count;
- }
-+function captureLeagueMovement(dt,key){
-+  if(match.state!=='PLAYING')return;
-+  if(key&&key!==lastMove)leagueTap=key;
-+  lastMove=key;
-+
-+  // Use the same 60 Hz clock as solo play and sample immediately on the next frame.
-+  moveCarry=Math.min(moveCarry+dt,0.5);
-+  const steps=Math.min(Math.floor(moveCarry/ONLINE_MOVE_STEP),LEAGUE_FRAME_LIMIT-queuedMoves.length);
-+  if(!steps)return;
-+  moveCarry-=steps*ONLINE_MOVE_STEP;
-+  queuedMoves+=encodeLeagueFrame(key||leagueTap,pending.bomb,pending.needle);
-+  queuedMoves+=encodeLeagueFrame(key,false,false).repeat(steps-1);
-+  pending={bomb:false,needle:false};
-+  leagueTap='';
-+}
- function captureRoomMovement(dt=0){
-   const key=MOVE_KEYS[roomDir()]||'';
-+  if(roomState?.timedInputs){captureLeagueMovement(dt,key);return;}
-+
-   if(key!==lastMove){
-     lastMove=key;
-     moveCarry=key?ONLINE_MOVE_STEP:0;
-@@ -26,7 +43,12 @@ function captureRoomMovement(dt=0){
- function predictRoomPlayer(player){
-   if(!player?.alive||!queuedMoves)return player;
-   const predicted=Object.assign(Object.create(Character.prototype),player);
--  for(const key of queuedMoves)match.stepOnlineMovement(predicted,key,ONLINE_MOVE_STEP);
-+  for(const key of queuedMoves){
-+    if(!roomState?.timedInputs){match.stepOnlineMovement(predicted,key,ONLINE_MOVE_STEP);continue;}
-+    const frame=decodeLeagueFrame(key);
-+    if(frame.needle&&predicted.trapped&&predicted.needles>0){predicted.needles--;predicted.trapped=false;}
-+    match.stepOnlineMovement(predicted,frame.direction,ONLINE_MOVE_STEP);
-+  }
-   return predicted;
- }
- const blankToken=()=>Array.from(crypto.getRandomValues(new Uint8Array(24)),b=>b.toString(16).padStart(2,'0')).join('');
-@@ -99,19 +121,26 @@ function present(r){
- function scheduleSync(){
-   clearTimeout(roomTimer);if(!roomSession)return;
-   const playing=roomState?.phase==='play';
--  const delay=playing?(queuedMoves?32:65):roomState?.phase==='end'?1100:700;
-+  const delay=playing?(roomState?.timedInputs?40:queuedMoves?32:65):roomState?.phase==='end'?1100:700;
-   roomTimer=setTimeout(()=>serverQueue(async()=>{
-     const current=roomSession;if(!current)return;
--    const actions=pending;pending={bomb:false,needle:false};
--    const attempt=current.pendingPacket||{round:roomState?.round,seq:++seq,direction:roomDir(),moveStart,moves:queuedMoves,...actions};
--    if(current.pendingPacket){pending.bomb||=actions.bomb;pending.needle||=actions.needle}
-+    const timedInputs=roomState?.timedInputs;
-+    let attempt;
-+    if(timedInputs){
-+      attempt={round:roomState.round,moveStart,frames:queuedMoves};
-+    }else{
-+      const actions=pending;
-+      pending={bomb:false,needle:false};
-+      attempt=current.pendingPacket||{round:roomState?.round,seq:++seq,direction:roomDir(),moveStart,moves:queuedMoves,...actions};
-+      if(current.pendingPacket){pending.bomb||=actions.bomb;pending.needle||=actions.needle}
-+    }
-     try{
-       const r=await post('/api/rooms/'+current.code+'/sync',current.token,attempt);
-       if(roomSession!==current)return;delete current.pendingPacket;present(r);
-     }catch(e){
-       if(roomSession!==current)return;
-       if(e.status===403||e.status===404){localLobby();openRoomForm(false,e.message);return}
--      current.pendingPacket=attempt;
-+      if(!timedInputs)current.pendingPacket=attempt;
-       if(match.online&&roomState?.phase==='play')match.notice('다시 연결 중…');else message('연결을 다시 확인하는 중이야.');
-     }finally{if(roomSession===current)scheduleSync()}
-   }),delay);
-@@ -119,7 +148,7 @@ function scheduleSync(){
- async function enterRoom(kind,code,token){
-   if(roomSession)return;
-   const path=kind==='join'?'/api/rooms/'+code+'/join':'/api/rooms/'+kind;
--  const r=await post(path,token,{choices:match.choices});roomSession={code:r.code,token};rememberRoom();present(r);scheduleSync();
-+  const r=await post(path,token,{choices:match.choices,inputVersion:2});roomSession={code:r.code,token};rememberRoom();present(r);scheduleSync();
- }
- function openRoomForm(join,msg=''){
-   $('roomTitle').textContent=join?'방 들어가기':'친구 대결';$('roomPanel').hidden=true;$('joinForm').hidden=!join;
-PATCH
+<!doctype html>
+<!-- 전체를 복사해 bubble-pop-arena.html로 UTF-8 저장한 뒤 브라우저에서 열면 돼.
+     혼자 하기와 리그전은 오프라인에서 실행돼. 리그 기록은 이 브라우저에 저장돼.
+     친구 추가, 방 코드 대결, 친구 순위를 공유하려면 서버가 필요해. -->
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>버블 팝 아레나</title>
+<style>
+  :root { --ink:#203043; --paper:#f8f8ed; --mint:#76ded8; --gold:#ffce4d; }
+  * { box-sizing:border-box; }
+  [hidden] { display:none !important; }
+  body {
+    margin:0;
+    color:var(--ink);
+    background:radial-gradient(#ced7c8 1px,transparent 1px) 0 0/12px 12px var(--paper);
+    font:15px system-ui,"Malgun Gothic",sans-serif;
+  }
+  button,select { font:inherit; color:inherit; }
+  button {
+    border:2px solid var(--ink);
+    border-radius:6px;
+    background:#fffdf3;
+    padding:8px 13px;
+    font-weight:750;
+    cursor:pointer;
+    touch-action:manipulation;
+  }
+  button:hover { filter:brightness(.97); }
+  button:focus-visible,select:focus-visible { outline:3px solid #087d94; outline-offset:3px; }
+  button:disabled { cursor:default; opacity:.55; }
+  header { border-bottom:2px solid var(--ink); background:#fafbef; }
+  nav {
+    max-width:1144px;
+    min-height:58px;
+    margin:auto;
+    padding:8px 24px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:8px;
+  }
+  .brand { font-weight:1000; white-space:nowrap; }
+  .brand b { color:#387577; }
+  nav div { display:flex; gap:6px; }
+  #league { background:#ffdf7b; }
+  main {
+    max-width:1144px;
+    margin:auto;
+    padding:clamp(14px,4vw,38px) clamp(12px,3vw,28px);
+    display:grid;
+    grid-template-columns:minmax(235px,1fr) minmax(0,1.6fr);
+    align-items:center;
+    gap:clamp(16px,5vw,65px);
+  }
+  h1 { margin:0 0 8px; font-size:clamp(24px,3.5vw,39px); letter-spacing:-.06em; }
+  #logo { display:block; width:min(310px,100%); height:auto; margin-bottom:5px; image-rendering:pixelated; }
+  p { line-height:1.65; }
+  .intro { margin:0 0 18px; color:#46545b; font-size:14px; }
+  fieldset { margin:0 0 10px; padding:0; border:0; }
+  legend { margin-bottom:6px; font-weight:800; }
+  .levels { display:flex; gap:6px; }
+  .levels label { flex:1; display:flex; position:relative; }
+  .levels input { position:absolute; opacity:0; }
+  .levels span {
+    width:100%;
+    padding:8px 4px;
+    border:2px solid var(--ink);
+    border-radius:6px;
+    background:#fffdf3;
+    font-weight:750;
+    text-align:center;
+    cursor:pointer;
+  }
+  .levels input:checked + span { background:var(--mint); }
+  .levels input:focus-visible + span { outline:3px solid #087d94; outline-offset:2px; }
+  .setting { display:flex; justify-content:space-between; align-items:center; gap:6px; margin:9px 0; font-weight:700; }
+  select { max-width:65%; padding:4px 6px; background:#fffdf3; border:1px solid #849a8e; border-radius:5px; }
+  details { border-top:1px solid #c5ccbf; padding:9px 0; }
+  summary { font-weight:750; cursor:pointer; }
+  #blocks { margin:5px 0; font-size:12px; color:#4a5b60; }
+  .start { background:var(--gold); box-shadow:3px 4px 0 var(--ink); margin:10px 0 4px; width:100%; padding:12px; }
+  .help { margin:17px 0 0; font-size:12px; color:#46545b; }
+  kbd { padding:2px 4px; border:1px solid #a8b7a8; border-radius:3px; background:#fffef5; color:var(--ink); }
+  .machine { background:#223147; border:3px solid #141f2b; border-radius:14px; padding:10px; box-shadow:5px 6px #85958a; min-width:0; }
+  .hud { min-height:37px; display:grid; grid-template-columns:1fr auto 1fr; gap:7px; align-items:start; color:#f7f9ec; font-weight:800; }
+  .hud small { display:block; font-size:10px; color:#c2d5d7; }
+  .hud div:last-child { text-align:right; }
+  #time { color:#fff2b1; font:800 24px monospace; }
+  #field { position:relative; border:2px solid #141f2b; }
+  #board { display:block; width:100%; height:auto; image-rendering:pixelated; touch-action:none; }
+  #overlay {
+    position:absolute;
+    inset:0;
+    display:grid;
+    place-content:center;
+    gap:12px;
+    padding:16px;
+    background:#172a3abb;
+    text-align:center;
+    color:white;
+  }
+  #overlay strong { font-size:clamp(24px,8vw,44px); text-shadow:2px 3px #172b3d; }
+  .touch { display:none; }
+  .playing #setup,.playing #league { display:none; }
+  .playing main { display:flex; justify-content:center; padding:8px; max-width:none; }
+  .playing .machine { width:min(100%, max(200px, calc((100dvh - 125px) * 15 / 13))); }
+  dialog {
+    width:min(425px,calc(100% - 24px));
+    max-height:90dvh;
+    overflow:auto;
+    border:3px solid var(--ink);
+    border-radius:12px;
+    background:var(--paper);
+    color:var(--ink);
+    padding:19px;
+    box-shadow:5px 6px var(--ink);
+  }
+  dialog::backdrop { background:#112636b8; }
+  dialog h2 { margin:0; }
+  dialog button { width:100%; margin-top:8px; }
+  table { width:100%; margin:13px 0; border-collapse:collapse; font-size:13px; }
+  th,td { border-bottom:1px solid #ccd7ca; padding:6px 3px; text-align:center; }
+  th:first-child { text-align:left; }
+  thead { background:#d8eee3; }
+  @media (max-width:700px) {
+    main { grid-template-columns:1fr; max-width:550px; }
+    nav { padding:6px 10px; }
+    nav button { padding:6px; font-size:12px; }
+    h1 { display:flex; align-items:center; gap:9px; }
+    #logo { width:115px; margin:0; }
+  }
+  @media (pointer:coarse), (max-width:700px) {
+    .playing .machine { width:min(100%, max(200px, calc((100dvh - 209px) * 15 / 13))); }
+    .playing .touch { display:flex; align-items:center; justify-content:space-between; gap:6px; padding-top:9px; }
+    .dpad { display:grid; grid-template:repeat(2,30px)/repeat(3,35px); gap:3px; }
+    .dpad button:first-child { grid-column:2; }
+    .dpad button:not(:first-child) { grid-row:2; }
+    .touch button { touch-action:none; user-select:none; padding:3px 5px; font-size:12px; background:#d8eee3; }
+    #drop { background:var(--gold); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <nav>
+    <span class="brand">BUBBLE POP <b>ARENA</b></span>
+    <div>
+      <button id="league">리그전</button>
+      <button id="pause" hidden>일시정지</button>
+      <button id="sound" aria-pressed="false">♪ 소리 끔</button>
+    </div>
+  </nav>
+</header>
+
+<main>
+  <section id="setup">
+    <h1><canvas id="logo" width="238" height="93" aria-label="BUBBLE POP!"></canvas>물풍선 대결</h1>
+    <p class="intro">AI와 마지막 한 명이 남을 때까지!<br>상대를 물방울에 가두고 다가가서 터뜨려 봐.</p>
+    <fieldset>
+      <legend>난이도</legend>
+      <div class="levels">
+        <label><input name="difficulty" type="radio" value="easy"><span>쉬움</span></label>
+        <label><input name="difficulty" type="radio" value="normal" checked><span>보통</span></label>
+        <label><input name="difficulty" type="radio" value="hard"><span>어려움</span></label>
+      </div>
+    </fieldset>
+    <label class="setting">함께할 AI
+      <select id="bots">
+        <option value="1">1명</option>
+        <option value="2">2명</option>
+        <option value="3">3명</option>
+      </select>
+    </label>
+    <details>
+      <summary>캐릭터 · 맵</summary>
+      <label class="setting">캐릭터
+        <select id="hero">
+          <option value="0">다오니 · 균형형</option>
+          <option value="1">푸른이 · 물풍선 +1</option>
+          <option value="2">번개 · 속도 +1</option>
+        </select>
+      </label>
+      <label class="setting">맵
+        <select id="map">
+          <option value="village">빌리지</option>
+          <option value="pirate">해적선 갑판</option>
+        </select>
+      </label>
+      <p id="blocks"></p>
+    </details>
+    <button id="solo" class="start">혼자 하기 ▶</button>
+    <p class="help"><kbd>방향키 / WASD</kbd> 이동 · <kbd>Space</kbd> 물풍선 · <kbd>C / Ctrl</kbd> 탈출</p>
+  </section>
+  <section class="machine" aria-label="게임 화면">
+    <div class="hud">
+      <div><small>PLAYER 1</small><span id="gear">플레이어</span></div>
+      <div><small>경과 시간</small><strong id="time">00:00</strong></div>
+      <div><small id="mode">RIVAL</small><span id="rival">AI BLUE</span></div>
+    </div>
+    <div id="field">
+      <canvas id="board" width="780" height="676" tabindex="-1" aria-label="물풍선 대결 맵"></canvas>
+      <div id="overlay" hidden>
+        <strong id="message"></strong>
+        <button id="resume" hidden>계속하기 ▶</button>
+        <button id="exit" hidden>메인으로</button>
+      </div>
+    </div>
+    <div class="touch">
+      <div class="dpad">
+        <button data-dir="0" aria-label="위">▲</button>
+        <button data-dir="2" aria-label="왼쪽">◀</button>
+        <button data-dir="1" aria-label="아래">▼</button>
+        <button data-dir="3" aria-label="오른쪽">▶</button>
+      </div>
+      <div><button id="escape">탈출</button><button id="drop">물풍선</button></div>
+    </div>
+  </section>
+</main>
+
+<dialog id="leagueDialog" aria-labelledby="leagueTitle">
+  <h2 id="leagueTitle">리그전</h2>
+  <p>1레벨 쉬움 → 2레벨 보통 → 3레벨 어려움.<br>이후 상대 수와 연속 대결이 늘어나. 레벨 상한은 없어.</p>
+  <p id="record"></p>
+  <button id="challenge" class="start">1레벨부터 도전 ▶</button>
+  <button id="closeLeague">닫기</button>
+</dialog>
+<dialog id="result" aria-labelledby="resultTitle">
+  <h2 id="resultTitle"></h2>
+  <p id="resultText"></p>
+  <table><thead id="resultHead"></thead><tbody id="resultBody"></tbody></table>
+  <button id="retry" class="start"></button>
+  <button id="home">메인으로</button>
+</dialog>
+
+<script>
+'use strict';
+
+const $ = id => document.getElementById(id);
+const board = $('board');
+const ctx = board.getContext('2d');
+const TILE = 52, COLS = 15, ROWS = 13;
+const FUSE = 2.55, TRAP = 4.6, STEP = 1 / 60;
+const DIR = [[0,-1],[0,1],[-1,0],[1,0]];
+const KEY = {ArrowUp:0,KeyW:0,ArrowDown:1,KeyS:1,ArrowLeft:2,KeyA:2,ArrowRight:3,KeyD:3};
+const COLORS = ['#f85f67','#478edc','#eba936','#ab7cdd'];
+const STATS = ['물풍선','깬 블록','아이템','갇힌 횟수','내 물풍선에 갇힘','탈출'];
+
+const maps = {
+  village: [
+    '###############','#...x..x..x...#','#.#.#.#.#.#.#.#',
+    '#.x..gx.x..g.x#','#.#x#.#.#.#x#.#','#x..x.....x..x#','#.#.#x#.#x#.#.#'
+  ],
+  pirate: [
+    '###############','#...x.....x...#','#.#.#x#.#x#.#.#',
+    '#..x..x.x..x..#','#.#.#.....#.#.#','#.x..x...x..x.#','#.#x#..#..#x#.#'
+  ]
+};
+const edits = {
+  village: {
+    easy:[[4,2,'.'],[10,2,'.'],[6,6,'.'],[13,5,'.'],[4,5,'.'],[1,5,'.'],[10,5,'.']],
+    hard:[[11,5,'#'],[6,1,'#'],[9,2,'x'],[13,2,'x'],[7,3,'x']]
+  },
+  pirate: {
+    easy:[[6,2,'.'],[2,4,'.'],[12,4,'.'],[8,3,'.'],[9,5,'.'],[3,6,'.'],[5,5,'.']],
+    hard:[[6,6,'#'],[7,4,'#'],[12,1,'x'],[5,1,'x'],[11,4,'x']]
+  }
+};
+const AI = {
+  easy:   {think:.20,gap:4.4,itemRadius:3,itemDelay:1.2,attack:.65,ownDelay:1.15,rivalDelay:1.65,needle:1.05,bias:0},
+  normal: {think:.16,gap:0,itemRadius:14,itemDelay:0,attack:.72,ownDelay:0,rivalDelay:0,needle:.7,bias:0},
+  hard:   {think:.16,gap:0,itemRadius:14,itemDelay:0,attack:.74,ownDelay:0,rivalDelay:0,needle:.7,bias:.115}
+};
+
+let grid, fighters, bombs, streams, items, options, profile;
+let phase = 'lobby', beforePause, stage = 0, wave = 1, elapsed = 0, countdown = 0, carry = 0;
+let best = 0, audio = null, soundOn = false, touch = null;
+const keys = new Map();
+try { best = Math.max(0, Number(localStorage.getItem('bubble-pop-local-best')) || 0); } catch {}
+
+const tileId = (c,r) => r * COLS + c;
+const center = n => (n + .5) * TILE;
+const cell = p => [Math.floor(p.x / TILE),Math.floor(p.y / TILE)];
+const inside = (c,r) => c >= 0 && c < COLS && r >= 0 && r < ROWS;
+const tile = (c,r) => inside(c,r) ? grid[r][c] : '#';
+const bombAt = (c,r) => bombs.find(b => b.c === c && b.r === r && !b.exploded);
+const walkable = (c,r) => tile(c,r) !== '#' && tile(c,r) !== 'x' && !bombAt(c,r);
+const nearBox = (c,r) => DIR.some(([x,y]) => tile(c+x,r+y) === 'x');
+const waves = () => 1 + Math.floor(Math.max(0,stage - 6) / 3);
+
+function boardFor(map, level) {
+  const top = maps[map].map(row => [...row]);
+  const result = [...top,...top.slice(0,-1).reverse().map(row => [...row].reverse())];
+  for (const [c,r,value] of edits[map][level] || []) {
+    result[r][c] = value;
+    result[ROWS-1-r][COLS-1-c] = value;
+  }
+  return result;
+}
+
+function settings() {
+  if (stage) {
+    return {map:'village',level:stage === 1 ? 'easy' : stage === 2 ? 'normal' : 'hard',
+      bots:stage < 4 ? 1 : stage < 7 ? 2 : 3,hero:0};
+  }
+  return {map:$('map').value,level:document.querySelector('[name=difficulty]:checked').value,
+    bots:Number($('bots').value),hero:Number($('hero').value)};
+}
+
+function reset() {
+  options = settings();
+  profile = AI[options.level];
+  grid = boardFor(options.map,options.level);
+  const colors = [options.hero,...[0,1,2,3].filter(n => n !== options.hero)];
+  fighters = [[1,1],[13,11],[13,1],[1,11]].slice(0,options.bots+1).map(([c,r],i) => ({
+    x:center(c),y:center(r),name:i ? (i === 1 ? 'AI BLUE' : 'AI ' + i) : '나',
+    color:COLORS[colors[i]],player:i === 0,alive:true,dir:1,
+    speed:options.hero === 2 ? 169 : 145,capacity:options.hero === 1 ? 2 : 1,range:1,
+    needles:1,trap:0,shield:0,think:0,bombWait:0,react:0,noticed:false,next:null,
+    stats:[0,0,0,0,0,0]
+  }));
+  bombs = [];
+  streams = [];
+  items = [];
+  elapsed = 0;
+  carry = 0;
+  keys.clear();
+  touch = null;
+  const inner = grid.slice(1,-1).flatMap(row => row.slice(1,-1));
+  $('blocks').textContent = '상자 ' + inner.filter(t => t === 'x').length +
+    '개 · 고정 벽돌 ' + inner.filter(t => t === '#').length + '개';
+  updateHud();
+}
+
+function message(text,paused = false) {
+  $('overlay').hidden = !text;
+  $('message').textContent = text;
+  $('resume').hidden = $('exit').hidden = !paused;
+}
+
+function start() {
+  reset();
+  phase = 'count';
+  countdown = 3;
+  document.body.classList.add('playing');
+  $('pause').hidden = false;
+  $('pause').textContent = '일시정지';
+  message('3');
+  window.scrollTo(0,0);
+  board.focus({preventScroll:true});
+}
+
+function lobby() {
+  for (const id of ['result','leagueDialog']) if ($(id).open) $(id).close();
+  stage = 0;
+  wave = 1;
+  phase = 'lobby';
+  document.body.classList.remove('playing');
+  $('pause').hidden = true;
+  message('');
+  reset();
+  $('solo').focus();
+}
+
+function pause() {
+  if (phase === 'paused') {
+    phase = beforePause;
+    $('pause').textContent = '일시정지';
+    message(phase === 'count' ? Math.ceil(countdown) : '');
+    board.focus({preventScroll:true});
+  } else if (phase === 'play' || phase === 'count') {
+    beforePause = phase;
+    phase = 'paused';
+    keys.clear();
+    touch = null;
+    $('pause').textContent = '계속하기';
+    message('일시정지',true);
+  }
+}
+
+function tone(from,to,duration) {
+  if (!soundOn || !audio) return;
+  const node = audio.createOscillator(), gain = audio.createGain(), now = audio.currentTime;
+  node.type = 'triangle';
+  node.frequency.setValueAtTime(from,now);
+  node.frequency.exponentialRampToValueAtTime(to,now+duration);
+  gain.gain.setValueAtTime(.1,now);
+  gain.gain.exponentialRampToValueAtTime(.001,now+duration);
+  node.connect(gain).connect(audio.destination);
+  node.start();
+  node.stop(now+duration);
+}
+
+function move(p,dir,dt) {
+  if (dir == null) return;
+  p.dir = dir;
+  const [c,r] = cell(p), [dx,dy] = DIR[dir];
+  const step = (p.trap ? 38 : p.speed) * dt;
+  const nc = c+dx, nr = r+dy, b = bombAt(nc,nr);
+  const blocked = tile(nc,nr) === '#' || tile(nc,nr) === 'x' ||
+    (b && Math.hypot(p.x-center(nc),p.y-center(nr)) > TILE * .68);
+  const toward = (value,target,max) => value + Math.sign(target-value) * Math.min(Math.abs(target-value),max);
+  if (dx) {
+    if (blocked) p.x = dx > 0 ? Math.min(center(c),p.x+step) : Math.max(center(c),p.x-step);
+    else { p.x += dx*step; p.y = toward(p.y,center(r),step*.85); }
+  } else {
+    if (blocked) p.y = dy > 0 ? Math.min(center(r),p.y+step) : Math.max(center(r),p.y-step);
+    else { p.y += dy*step; p.x = toward(p.x,center(c),step*.85); }
+  }
+}
+
+function blast(b,visit) {
+  visit(b.c,b.r,-1);
+  for (const [dir,[dx,dy]] of DIR.entries()) {
+    for (let s = 1; s <= b.range; s++) {
+      const c = b.c+dx*s, r = b.r+dy*s, value = tile(c,r);
+      if (value === '#') break;
+      visit(c,r,dir);
+      if (value === 'x') break;
+    }
+  }
+}
+
+function danger(bot,extra) {
+  const bad = new Set(streams.map(s => tileId(s.c,s.r)));
+  for (const b of bombs) {
+    const delay = b.owner === bot ? profile.ownDelay : profile.rivalDelay;
+    if (FUSE - b.timer >= delay) blast(b,(c,r) => bad.add(tileId(c,r)));
+  }
+  if (extra) blast(extra,(c,r) => bad.add(tileId(c,r)));
+  return bad;
+}
+
+// 가까운 칸부터 탐색하고, 출발점에서 처음 이동할 방향을 함께 저장한다.
+function routes(c,r,bad,escaping,order,limit) {
+  const queue = [{c,r,d:0,dir:null}];
+  const seen = new Set([tileId(c,r)]);
+  for (let i = 0; i < queue.length; i++) {
+    const p = queue[i];
+    if (p.d >= limit) continue;
+    for (const dir of order) {
+      const [dx,dy] = DIR[dir], x = p.c+dx, y = p.r+dy, id = tileId(x,y);
+      if (!walkable(x,y) || seen.has(id) || (!escaping && bad.has(id))) continue;
+      seen.add(id);
+      queue.push({c:x,r:y,d:p.d+1,dir:p.dir ?? dir});
+    }
+  }
+  return queue.slice(1);
+}
+
+function botDirection(bot,c,r,bad,escaping) {
+  const order = [0,1,2,3].sort(() => Math.random()-.5);
+  if (escaping && bot.next != null && Math.random() < profile.bias) {
+    order.splice(order.indexOf(bot.next),1);
+    order.unshift(bot.next);
+  }
+  const path = routes(c,r,bad,escaping,order,14);
+  if (escaping) return path.find(p => !bad.has(tileId(p.c,p.r)))?.dir ?? path[0]?.dir;
+
+  const rivals = fighters.filter(p => p.alive && p !== bot);
+  const targets = rivals.map(p => ({p,at:cell(p),distance:Math.abs(p.x-bot.x)+Math.abs(p.y-bot.y)}));
+  const target = targets.sort((a,b) => a.distance-b.distance).find(t => !t.p.trap);
+  let hunt, crate;
+  for (const p of path) {
+    if (targets.some(t => t.p.trap && t.at[0] === p.c && t.at[1] === p.r)) return p.dir;
+    if (p.d <= profile.itemRadius && items.some(it => it.c === p.c && it.r === p.r && elapsed-it.at >= profile.itemDelay)) return p.dir;
+    if (target && Math.abs(target.at[0]-p.c)+Math.abs(target.at[1]-p.r) <= 2) hunt ??= p.dir;
+    if (nearBox(p.c,p.r)) crate ??= p.dir;
+  }
+  return hunt ?? crate ?? path[0]?.dir;
+}
+
+function putBomb(p) {
+  const [c,r] = cell(p);
+  if (!p.alive || p.trap || !walkable(c,r) || bombs.filter(b => b.owner === p).length >= p.capacity) return false;
+  bombs.push({c,r,owner:p,range:p.range,timer:FUSE,exploded:false});
+  p.stats[0]++;
+  if (p.player) tone(320,560,.12);
+  return true;
+}
+
+function botTurn(bot,dt) {
+  const [c,r] = cell(bot), bad = danger(bot), escaping = bad.has(tileId(c,r));
+  bot.bombWait = Math.max(0,bot.bombWait-dt);
+  if (escaping && !bot.noticed) bot.react = options.level === 'easy' ? .12 : 0;
+  bot.noticed = escaping;
+  if (escaping && bot.react > 0) { bot.react -= dt; return; }
+  bot.think -= dt;
+  if (escaping || bot.next == null || bot.think <= 0) {
+    bot.next = botDirection(bot,c,r,bad,escaping);
+    bot.think = profile.think;
+  }
+  move(bot,bot.next,dt);
+  if (escaping || bot.trap || bot.bombWait > 0 || bombs.filter(b => b.owner === bot).length >= bot.capacity) return;
+
+  const [x,y] = cell(bot);
+  const close = fighters.some(p => {
+    if (!p.alive || p === bot || p.trap) return false;
+    const [pc,pr] = cell(p), dx = Math.abs(pc-x), dy = Math.abs(pr-y);
+    return dx+dy <= 2 || ((dx === 0 || dy === 0) && dx+dy <= bot.range);
+  });
+  if (!nearBox(x,y) && !(close && Math.random() < profile.attack)) return;
+  const predicted = danger(bot,{c:x,r:y,range:bot.range});
+  if (routes(x,y,predicted,true,[0,1,2,3],6).some(p => !predicted.has(tileId(p.c,p.r))) && putBomb(bot)) {
+    bot.bombWait = profile.gap;
+    bot.think = 0;
+  }
+}
+
+function explode(b) {
+  if (b.exploded) return;
+  b.exploded = true;
+  tone(180,45,.22);
+  blast(b,(c,r,dir) => {
+    items = items.filter(it => it.c !== c || it.r !== r);
+    const chained = bombAt(c,r);
+    if (chained) explode(chained);
+    const value = tile(c,r);
+    if (value === 'x') {
+      b.owner.stats[1]++;
+      const id = Math.min(tileId(c,r),tileId(COLS-1-c,ROWS-1-r));
+      const kind = [0,1,2,0,1,3,2,4][(id*13+3)%8];
+      if ((id*97+31)%101 < 44) items.push({c,r,kind,at:elapsed});
+    }
+    if (value === 'x' || value === 'g') grid[r][c] = '.';
+    streams.push({c,r,dir,owner:b.owner,timer:.48});
+  });
+}
+
+function escape(p) {
+  if (!p.alive || !p.trap || !p.needles) return;
+  p.needles--;
+  p.stats[5]++;
+  p.trap = 0;
+  p.shield = 1.4;
+  if (p.player) tone(700,1350,.18);
+}
+
+function collect(p,c,r) {
+  const index = items.findIndex(it => it.c === c && it.r === r);
+  if (index < 0) return;
+  const [{kind}] = items.splice(index,1);
+  if (kind === 0) p.capacity = Math.min(7,p.capacity+1);
+  if (kind === 1) p.range = Math.min(7,p.range+1);
+  if (kind === 2) p.speed = Math.min(289,p.speed+24);
+  if (kind === 3) p.needles++;
+  if (kind === 4) p.range = 7;
+  p.stats[2]++;
+  if (p.player) tone(523,784,.14);
+}
+
+function step(dt) {
+  elapsed += dt;
+  for (const b of bombs) {
+    b.timer -= dt;
+    if (b.timer <= 0) explode(b);
+  }
+  bombs = bombs.filter(b => !b.exploded);
+  for (const s of streams) s.timer -= dt;
+  streams = streams.filter(s => s.timer > 0);
+
+  for (const p of fighters) {
+    if (!p.alive) continue;
+    p.shield = Math.max(0,p.shield-dt);
+    if (p.trap > 0) {
+      p.trap -= dt;
+      if (p.trap <= 0) { p.alive = false; continue; }
+      if (!p.player && TRAP-p.trap >= profile.needle) escape(p);
+    }
+    if (p.player) move(p,touch ?? Array.from(keys.values()).at(-1),dt);
+    else botTurn(p,dt);
+    const [c,r] = cell(p), hit = streams.find(s => s.c === c && s.r === r);
+    if (!p.trap && !p.shield && hit) {
+      p.trap = TRAP;
+      p.stats[3]++;
+      if (hit.owner === p) p.stats[4]++;
+      if (p.player) tone(440,220,.2);
+    }
+    if (!p.trap) collect(p,c,r);
+  }
+  for (const p of fighters) {
+    if (p.alive && p.trap && fighters.some(q => q.alive && !q.trap && q !== p &&
+      Math.hypot(p.x-q.x,p.y-q.y) < TILE*.65)) p.alive = false;
+  }
+  const player = fighters[0];
+  if (!player.alive || fighters.filter(p => p.alive).length === 1) finish(player.alive);
+}
+
+function updateHud() {
+  const t = Math.floor(elapsed), stamp = n => String(n).padStart(2,'0');
+  $('time').textContent = stamp(Math.floor(t/60)) + ':' + stamp(t%60);
+  const player = fighters[0];
+  $('gear').textContent = phase === 'lobby' ? '플레이어' : player.trap ?
+    (player.needles ? 'C · 탈출' : '갇힘') : '바늘 ' + player.needles;
+  $('mode').textContent = stage ? '리그전 · Lv. ' + stage : 'RIVAL';
+  $('rival').textContent = stage ? '대결 ' + wave + '/' + waves() :
+    options.bots === 1 ? 'AI BLUE' : 'AI ' + fighters.slice(1).filter(p => p.alive).length + '명';
+  $('escape').disabled = !player.trap || !player.needles;
+}
+
+function resultRow(values,heading = false) {
+  const row = document.createElement('tr');
+  values.forEach((value,i) => {
+    const td = document.createElement(heading || !i ? 'th' : 'td');
+    td.textContent = value;
+    row.append(td);
+  });
+  return row;
+}
+
+function finish(win) {
+  phase = 'end';
+  keys.clear();
+  touch = null;
+  $('pause').hidden = true;
+  if (stage && win && wave === waves()) {
+    best = Math.max(best,stage);
+    try { localStorage.setItem('bubble-pop-local-best',String(best)); } catch {}
+  }
+  $('resultTitle').textContent = stage ? (win ? (wave < waves() ? '대결 승리' : 'Lv. ' + stage + ' 클리어') : '리그전 종료') :
+    (win ? '승리' : fighters.some(p => p.alive) ? '패배' : '무승부');
+  $('resultText').textContent = '대결 시간 ' + elapsed.toFixed(1) + '초' + (stage ? ' · 내 최고 Lv. ' + best : '');
+  $('resultHead').replaceChildren(resultRow(['대결 기록',...fighters.map(p => p.name)],true));
+  $('resultBody').replaceChildren(...STATS.map((s,i) => resultRow([s,...fighters.map(p => p.stats[i])])));
+  $('retry').textContent = stage ? (win ? (wave < waves() ? '다음 대결 ▶' : '다음 레벨 ▶') : '1레벨부터 다시 ▶') : '한 판 더 ▶';
+  $('retry').onclick = () => {
+    $('result').close();
+    if (stage) {
+      if (!win) { stage = 1; wave = 1; }
+      else if (wave < waves()) wave++;
+      else { stage++; wave = 1; }
+    }
+    start();
+  };
+  $('result').showModal();
+}
+
+// 픽셀 아트와 맵 타일을 한 번 그린 뒤 게임 화면에서 재사용한다.
+function paint(g,color,x,y,w,h) {
+  g.fillStyle = color;
+  g.fillRect(x,y,w,h);
+}
+
+function makeSprite(w,h,draw) {
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  draw(c.getContext('2d'));
+  return c;
+}
+
+const ink = '#203449';
+const balloon = makeSprite(20,20,g => {
+  g.fillStyle = ink;
+  g.beginPath(); g.arc(10,10,8,0,Math.PI*2); g.fill();
+  g.fillStyle = '#159dba';
+  g.beginPath(); g.arc(10,9,7,0,Math.PI*2); g.fill();
+  g.fillStyle = '#4ddade';
+  g.beginPath(); g.arc(9,8,5.5,0,Math.PI*2); g.fill();
+  paint(g,'#c5fff3',5,4,3,2);
+  paint(g,'#fff9dc',4,6,2,3);
+  paint(g,ink,9,0,4,3);
+  paint(g,'#fff9dc',10,0,2,2);
+});
+
+const mascot = [
+  '.......xxxxx........','.....xxlllllxx......','....xllwhhhlllx.....',
+  '...xlwwhlllllllx....','...xlwhlllllabblx...','..xlllllllaabbbbx...',
+  '..xlllxxxxxxxxbbx...','..xllxfffffffpxbx...','..xbxfkfffkfffpxx...',
+  '..xbxfkfffkffppxx...','...xxfffrffpppxx....','....xxpppppppxx.....',
+  '...xllxxxxxxxllx....','..xlllxlwwxlabbx....','..xffxllwlllxppx....',
+  '...xxxlxxxlxxxx.....','....xllllxlllx......','....xsssx.xsssx.....','....xxxxx.xxxxx.....'
+];
+
+const art = COLORS.map((color,i) => makeSprite(20,20,g => {
+  const shade = ['#e84758','#387bc9','#cb852f','#9564c7'][i];
+  const palette = {x:ink,l:color,h:'#ffdbbc',w:'#fff9e8',a:shade,b:shade,
+    f:'#ffe5b3',p:'#eab585',k:ink,r:'#e99883',s:'#75606d'};
+  mascot.forEach((line,y) => [...line].forEach((v,x) => {
+    if (palette[v]) paint(g,palette[v],x,y,1,1);
+  }));
+}));
+
+const glyph = {
+  B:'11110/11001/11001/11110/11001/11001/11110',
+  U:'11001/11001/11001/11001/11001/11001/01110',
+  L:'11000/11000/11000/11000/11000/11000/11111',
+  E:'11111/11000/11000/11110/11000/11000/11111',
+  P:'11110/11001/11001/11110/11000/11000/11000',
+  O:'01110/11001/11001/11001/11001/11001/01110',
+  '!':'11/11/11/11/11/00/11'
+};
+
+function drawLogo() {
+  const g = $('logo').getContext('2d');
+  g.imageSmoothingEnabled = false;
+  function word(text,x,y,k,top,bottom) {
+    const dots = [];
+    for (const letter of text) {
+      const rows = glyph[letter].split('/');
+      rows.forEach((row,j) => [...row].forEach((v,i) => {
+        if (v === '1') dots.push([x+i*k,y+j*k,j]);
+      }));
+      x += (rows[0].length+1)*k;
+    }
+    for (const [a,b] of dots) paint(g,ink,a-2,b-2,k+4,k+8);
+    for (const [a,b,j] of dots) paint(g,j < 4 ? top : bottom,a,b,k,k);
+  }
+  word('BUBBLE',5,3,6,'#89e8dd','#46c7be');
+  word('POP!',5,52,5,'#ffe584','#ffbd3e');
+  g.drawImage(balloon,142,46,45,45);
+  g.drawImage(balloon,186,58,28,28);
+  paint(g,'#ffce4d',221,22,4,12);
+  paint(g,'#ffce4d',217,26,12,4);
+}
+
+const tileArt = ['village','pirate'].map(map => Object.fromEntries(['.','#','x','g','~'].map(kind => [
+  kind,[0,1].map(v => makeSprite(24,24,g => {
+    const p = (color,x,y,w,h) => paint(g,color,x,y,w,h);
+    const pirate = map === 'pirate';
+    p((pirate ? ['#daba89','#cfad7f'] : ['#b7e3a5','#aad99a'])[v],0,0,24,24);
+    p(pirate ? '#ae865d' : '#99ca91',0,23,24,1);
+    if (pirate) { p('#eed09a',0,11,24,1); p('#b38b63',7+v*6,1,1,10); }
+    else { p('#8bc38a',5,15,3,1); p('#8bc38a',7,13,1,2); }
+    if (kind === '#') {
+      p(pirate ? '#454961' : '#386c7d',1,3,22,21);
+      p(pirate ? '#929c9d' : '#4996a9',1,1,22,20);
+      p(pirate ? '#6c7180' : '#b8e5e3',3,2,18,15);
+      p(pirate ? '#d5b06d' : '#dcf2e9',3,3,18,2);
+      p(pirate ? '#ac7d50' : '#92cbd2',3,15,18,2);
+    }
+    if (kind === 'x') {
+      p('#794c39',1,1,22,21);
+      p('#f0ad67',2,2,20,17);
+      p('#ad6844',5,5,14,12);
+      p('#ca8250',6,6,12,10);
+      for (let i=0;i<13;i++) p('#f4b36f',5+i,15-Math.floor(i*.7),2,2);
+      p('#ffd496',3,3,18,2);
+      p('#ffc07e',3,17,18,2);
+    }
+    if (kind === 'g') {
+      p('#579160',2,10,20,10);
+      p('#77b771',4,7,15,11);
+      p('#b4d98f',8,6,7,3);
+    }
+    if (kind === '~') {
+      p(v ? '#5ab9ce' : '#61c1d2',0,0,24,24);
+      p('#9ae2dd',0,0,24,1);
+      p('#368ba9',0,23,24,1);
+      p('#98e4e3',3,7,6,1);
+      p('#89d7dc',13,15,6,1);
+    }
+  }))
+])));
+
+function draw(now) {
+  ctx.imageSmoothingEnabled = false;
+  const tiles = tileArt[options.map === 'pirate' ? 1 : 0];
+  for (let r=0;r<ROWS;r++) for (let c=0;c<COLS;c++) {
+    const edge = !r || !c || r === ROWS-1 || c === COLS-1;
+    ctx.drawImage(tiles[edge ? '~' : grid[r][c]][(r+c)%2],c*TILE,r*TILE,TILE,TILE);
+  }
+  for (const it of items) {
+    const x = center(it.c), y = center(it.r)+Math.sin(now/150)*3;
+    paint(ctx,ink,x-13,y-13,26,26);
+    paint(ctx,['#72dbe2','#a4c9f3','#ffdd73','#ffa4af','#dcb1f3'][it.kind],x-11,y-11,22,22);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = ink;
+    ctx.font = 'bold 19px monospace';
+    ctx.fillText(['●','↔','»','✦','★'][it.kind],x,y+6);
+  }
+  for (const b of bombs) {
+    const size = 46+Math.round(Math.sin(now/100)*3);
+    ctx.drawImage(balloon,center(b.c)-size/2,center(b.r)-size/2,size,size);
+  }
+  for (const s of streams) {
+    const x = s.c*TILE, y = s.r*TILE;
+    ctx.globalAlpha = Math.min(1,s.timer*4);
+    paint(ctx,'#299ec6',x+1,y+2,50,48);
+    paint(ctx,'#72e1eb',x+4,y+5,44,42);
+    if (s.dir < 2) paint(ctx,'#ddfff1',x+21,y,10,52);
+    if (s.dir < 0 || s.dir >= 2) paint(ctx,'#ddfff1',x,y+21,52,10);
+    ctx.globalAlpha = 1;
+  }
+  for (const p of fighters) {
+    if (!p.alive) continue;
+    const x = Math.round(p.x), y = Math.round(p.y);
+    if (p.shield && Math.floor(now/70)%2) ctx.globalAlpha = .55;
+    paint(ctx,'#64968c',x-17,y+14,34,5);
+    ctx.drawImage(art[COLORS.indexOf(p.color)],x-25,y-26,50,50);
+    ctx.globalAlpha = 1;
+    if (p.trap) {
+      ctx.fillStyle = '#67d6ef88';
+      ctx.strokeStyle = '#258da9';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(x,y,24+Math.sin(now/110)*2,0,Math.PI*2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    if (phase === 'lobby' || phase === 'count' || p.player) {
+      paint(ctx,ink,x-21,y-42,42,16);
+      ctx.fillStyle = p.player ? '#ffdb65' : '#bdeaf8';
+      ctx.font = 'bold 12px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(p.player ? 'YOU' : p.name,x,y-30);
+    }
+  }
+}
+
+// 혼자 하기와 리그전 모두 같은 60Hz 시뮬레이션과 입력 처리를 사용한다.
+let last = performance.now();
+
+function frame(now) {
+  const delta = Math.min(.25,Math.max(0,(now-last)/1000));
+  last = now;
+  if (phase === 'count') {
+    countdown -= delta;
+    if (countdown <= 0) { phase = 'play'; message(''); }
+    else $('message').textContent = Math.ceil(countdown);
+  } else if (phase === 'play') {
+    carry += delta;
+    while (carry >= STEP && phase === 'play') {
+      step(STEP);
+      carry -= STEP;
+    }
+  }
+  updateHud();
+  draw(now);
+  requestAnimationFrame(frame);
+}
+
+$('solo').onclick = () => { stage = 0; start(); };
+$('league').onclick = () => {
+  $('record').textContent = best ? '이 브라우저 최고 기록 · Lv. ' + best : '아직 클리어 기록이 없어.';
+  $('leagueDialog').showModal();
+};
+$('closeLeague').onclick = () => $('leagueDialog').close();
+$('challenge').onclick = () => {
+  $('leagueDialog').close();
+  stage = 1;
+  wave = 1;
+  start();
+};
+
+$('pause').onclick = $('resume').onclick = pause;
+$('home').onclick = $('exit').onclick = lobby;
+$('result').addEventListener('cancel',event => { event.preventDefault(); lobby(); });
+$('setup').addEventListener('change',reset);
+
+$('sound').onclick = () => {
+  try {
+    audio ??= new (window.AudioContext || window.webkitAudioContext)();
+    if (audio.state === 'suspended') audio.resume().catch(() => {});
+    soundOn = !soundOn;
+    $('sound').setAttribute('aria-pressed',String(soundOn));
+    $('sound').textContent = soundOn ? '♪ 소리 켬' : '♪ 소리 끔';
+    tone(480,720,.09);
+  } catch {
+    $('sound').textContent = '소리 사용 불가';
+  }
+};
+
+window.addEventListener('keydown',event => {
+  if (event.code === 'Escape' && !event.repeat && !$('result').open && !$('leagueDialog').open) {
+    if (phase !== 'lobby') event.preventDefault();
+    pause();
+    return;
+  }
+  if (phase !== 'play' || event.altKey || event.metaKey) return;
+  if (Object.hasOwn(KEY,event.code) && !event.ctrlKey) {
+    event.preventDefault();
+    if (!keys.has(event.code)) keys.set(event.code,KEY[event.code]);
+  }
+  if (event.code === 'Space' || ['KeyC','ControlLeft','ControlRight'].includes(event.code)) {
+    event.preventDefault();
+    if (!event.repeat) {
+      if (event.code === 'Space') putBomb(fighters[0]);
+      else escape(fighters[0]);
+    }
+  }
+});
+window.addEventListener('keyup',event => keys.delete(event.code));
+window.addEventListener('blur',() => { if (phase === 'play' || phase === 'count') pause(); });
+document.addEventListener('visibilitychange',() => {
+  if (document.hidden && (phase === 'play' || phase === 'count')) pause();
+});
+
+let touchPointer = null;
+for (const button of document.querySelectorAll('[data-dir]')) {
+  button.onpointerdown = event => {
+    event.preventDefault();
+    if (phase !== 'play') return;
+    touchPointer = event.pointerId;
+    touch = Number(button.dataset.dir);
+    button.setPointerCapture(event.pointerId);
+  };
+  button.onlostpointercapture = event => {
+    if (touchPointer === event.pointerId) {
+      touch = null;
+      touchPointer = null;
+    }
+  };
+}
+$('drop').onpointerdown = event => {
+  event.preventDefault();
+  if (phase === 'play') putBomb(fighters[0]);
+};
+$('escape').onclick = () => { if (phase === 'play') escape(fighters[0]); };
+
+drawLogo();
+reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
