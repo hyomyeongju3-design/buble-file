@@ -1,0 +1,219 @@
+git apply <<'PATCH'
+diff --git a/server/rooms.js b/server/rooms.js
+index 9eaca40..12dabc6 100644
+--- a/server/rooms.js
++++ b/server/rooms.js
+@@ -61,12 +61,48 @@ function advance(room,now){
+     }
+     w.updatePlaying(ONLINE_MOVE_STEP);
+   }
+-  room.tickAt=since+ticks*dt;room.game=w.save();
+-  if(w.done){
+-    room.phase='end';
+-    const winner=w.characters.find(ch=>ch.alive);
+-    if(room.rankCode&&winner?.isPlayer&&room.wave<room.waves)startLeagueBattle(room,room.stage,room.wave+1,now);
++  room.tickAt=since+ticks*dt;
++  finishRoomTick(room,w,now);
++}
++function finishRoomTick(room,world,now){
++  room.game=world.save();
++  if(!world.done)return;
++  room.phase='end';
++  const winner=world.characters.find(ch=>ch.alive);
++  if(room.rankCode&&winner?.isPlayer&&room.wave<room.waves)startLeagueBattle(room,room.stage,room.wave+1,now);
++}
++function advanceLeagueFrames(room,member,data,now){
++  if(now<room.startAt||data.round!==room.round)return;
++  const {moveStart,frames}=data;
++  if(!Number.isSafeInteger(moveStart)||moveStart<1||typeof frames!=='string'
++     ||frames.length>LEAGUE_FRAME_LIMIT||!/^[0-9A-V]*$/.test(frames))return;
++
++  const applied=room.game.inputs[member.id]?.applied??0;
++  const offset=applied+1-moveStart;
++  if(offset<0||offset>=frames.length)return;
++
++  const stepMs=1000*ONLINE_MOVE_STEP;
++  const steps=Math.min(60,frames.length-offset,Math.floor((now-room.tickAt)/stepMs));
++  if(steps<=0)return;
++  const world=SharedArena.restore(room),player=world.characters.find(ch=>ch.id===member.id);
++  if(!player)return;
++  const input={direction:'',moves:'',applied};
++  world.inputs[member.id]=input;
++
++  // Consume one real simulation tick for every command, including standing still.
++  // Never advance a ranked match past the player's latest available input.
++  let processed=0;
++  for(;processed<steps&&!world.done;processed++){
++    const frame=decodeLeagueFrame(frames[offset+processed]);
++    if(frame.bomb)world.placeBomb(player);
++    if(frame.needle)world.triggerPlayerNeedle(player);
++    input.moves=frame.direction||'';
++    world.updatePlaying(ONLINE_MOVE_STEP);
++    input.applied=applied+processed+1;
+   }
++  input.moves='';
++  room.tickAt+=processed*stepMs;
++  finishRoomTick(room,world,now);
+ }
+ function removeMember(room,id){
+   room.members=room.members.filter(p=>p.id!==id);
+@@ -79,7 +115,7 @@ function removeMember(room,id){
+ }
+ function publicState(room,id,now){
+   const result={code:room.code,me:id,host:room.host,phase:room.phase,round:room.round,choices:room.choices,
+-    ranked:!!room.rankCode,stage:room.stage,wave:room.wave,waves:room.waves,bots:Math.min(room.choices.bots,4-room.members.length),members:room.members.map(({id,name})=>({id,name})),countdown:Math.max(0,(room.startAt-now)/1000)};
++    ranked:!!room.rankCode,timedInputs:room.timedInputs===true,stage:room.stage,wave:room.wave,waves:room.waves,bots:Math.min(room.choices.bots,4-room.members.length),members:room.members.map(({id,name})=>({id,name})),countdown:Math.max(0,(room.startAt-now)/1000)};
+   if(room.game){
+     const {inputs,...game}=room.game,input=inputs[id];
+     result.game=game;
+@@ -100,7 +136,7 @@ function applyRoom(room,op,data,secret,now){
+   }
+   if(!member)fail(403,'방 연결이 끝났어. 다시 입장해 줘.');
+   member.lastSeen=now;
+-  advance(room,now);
++  if(!room.timedInputs)advance(room,now);
+   if(op==='leave'){removeMember(room,member.id);return {left:true}}
+   if(['settings','start','rematch'].includes(op)&&member.id!==room.host)fail(403,'방장만 진행할 수 있어.');
+   if(op==='settings'){
+@@ -119,7 +155,9 @@ function applyRoom(room,op,data,secret,now){
+     const w=new SharedArena();w.setupWorld(room.choices,room.members,bots);w.inputs={};room.game=w.save();
+     room.phase='play';room.round++;room.startAt=now+2400;room.tickAt=room.startAt;
+   }
+-  if(op==='sync'&&room.phase==='play'&&data.round===room.round&&Number.isSafeInteger(data.seq)&&data.seq>0){
++  if(op==='sync'&&room.phase==='play'&&room.timedInputs){
++    advanceLeagueFrames(room,member,data,now);
++  }else if(op==='sync'&&room.phase==='play'&&data.round===room.round&&Number.isSafeInteger(data.seq)&&data.seq>0){
+     const prev=room.game.inputs[member.id];
+     if(!prev||data.seq>prev.seq){
+       const w=SharedArena.restore(room),ch=w.characters.find(c=>c.id===member.id);
+@@ -160,7 +198,7 @@ async function handleRoom(request,env){
+         const code=randomCode(),id=crypto.randomUUID(),member={id,name:'P1',secret,lastSeen:now};
+         const room={code,host:id,members:[member],phase:'wait',round:0,startAt:0,choices:cleanChoices(data.choices),game:null};
+         if(ranked){
+-          room.rankCode=profile.code;startLeagueBattle(room,1,1,now);
++          room.rankCode=profile.code;room.timedInputs=data.inputVersion===2;startLeagueBattle(room,1,1,now);
+         }
+         const out=await db.prepare('INSERT OR IGNORE INTO arena_rooms (code,revision,expires,payload) VALUES (?,1,?,?)').bind(code,now+ROOM_TTL,JSON.stringify(room)).run();
+         if(out.meta.changes)return json(publicState(room,id,now),201);
+diff --git a/web/engine.js b/web/engine.js
+index f5fc045..15008a5 100644
+--- a/web/engine.js
++++ b/web/engine.js
+@@ -169,6 +169,20 @@ const MOVE_DIRECTIONS = {
+     L: ['left', -1, 0], R: ['right', 1, 0]
+ };
+ 
++const LEAGUE_FRAME_LIMIT = 180;
++const LEAGUE_FRAME_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUV';
++const LEAGUE_FRAME_DIRECTIONS = ['', 'U', 'D', 'L', 'R'];
++
++function encodeLeagueFrame(direction, bomb, needle) {
++    return LEAGUE_FRAME_ALPHABET[LEAGUE_FRAME_DIRECTIONS.indexOf(direction) |
++        (bomb ? 8 : 0) | (needle ? 16 : 0)];
++}
++
++function decodeLeagueFrame(frame) {
++    const code = LEAGUE_FRAME_ALPHABET.indexOf(frame);
++    return {direction: LEAGUE_FRAME_DIRECTIONS[code & 7], bomb: !!(code & 8), needle: !!(code & 16)};
++}
++
+ class DuelEngine {
+             stepOnlineMovement(player, key, dt) {
+                 const move = MOVE_DIRECTIONS[key];
+diff --git a/web/rooms.js b/web/rooms.js
+index 1c0e407..3a2699a 100644
+--- a/web/rooms.js
++++ b/web/rooms.js
+@@ -1,17 +1,34 @@
+ 'use strict';
+ let roomSession=null,roomState=null,roomTimer=0,seq=0,queue=Promise.resolve(),pending={bomb:false,needle:false};
+ // Keep a bounded list of unacknowledged movement steps to replay on the local player.
+-let queuedMoves='', moveStart=1, moveCarry=0, lastMove='';
++let queuedMoves='', moveStart=1, moveCarry=0, lastMove='', leagueTap='';
+ function resetRoomMovement(received=0){
+-  queuedMoves='';moveStart=received+1;moveCarry=0;lastMove='';
++  queuedMoves='';moveStart=received+1;moveCarry=0;lastMove='';leagueTap='';
+ }
+ function acknowledgeRoomMovement(applied){
+   const count=Math.max(0,applied-moveStart+1);
+   queuedMoves=queuedMoves.slice(count);
+   moveStart+=count;
+ }
++function captureLeagueMovement(dt,key){
++  if(match.state!=='PLAYING')return;
++  if(key&&key!==lastMove)leagueTap=key;
++  lastMove=key;
++
++  // Use the same 60 Hz clock as solo play and sample immediately on the next frame.
++  moveCarry=Math.min(moveCarry+dt,0.5);
++  const steps=Math.min(Math.floor(moveCarry/ONLINE_MOVE_STEP),LEAGUE_FRAME_LIMIT-queuedMoves.length);
++  if(!steps)return;
++  moveCarry-=steps*ONLINE_MOVE_STEP;
++  queuedMoves+=encodeLeagueFrame(key||leagueTap,pending.bomb,pending.needle);
++  queuedMoves+=encodeLeagueFrame(key,false,false).repeat(steps-1);
++  pending={bomb:false,needle:false};
++  leagueTap='';
++}
+ function captureRoomMovement(dt=0){
+   const key=MOVE_KEYS[roomDir()]||'';
++  if(roomState?.timedInputs){captureLeagueMovement(dt,key);return;}
++
+   if(key!==lastMove){
+     lastMove=key;
+     moveCarry=key?ONLINE_MOVE_STEP:0;
+@@ -26,7 +43,12 @@ function captureRoomMovement(dt=0){
+ function predictRoomPlayer(player){
+   if(!player?.alive||!queuedMoves)return player;
+   const predicted=Object.assign(Object.create(Character.prototype),player);
+-  for(const key of queuedMoves)match.stepOnlineMovement(predicted,key,ONLINE_MOVE_STEP);
++  for(const key of queuedMoves){
++    if(!roomState?.timedInputs){match.stepOnlineMovement(predicted,key,ONLINE_MOVE_STEP);continue;}
++    const frame=decodeLeagueFrame(key);
++    if(frame.needle&&predicted.trapped&&predicted.needles>0){predicted.needles--;predicted.trapped=false;}
++    match.stepOnlineMovement(predicted,frame.direction,ONLINE_MOVE_STEP);
++  }
+   return predicted;
+ }
+ const blankToken=()=>Array.from(crypto.getRandomValues(new Uint8Array(24)),b=>b.toString(16).padStart(2,'0')).join('');
+@@ -99,19 +121,26 @@ function present(r){
+ function scheduleSync(){
+   clearTimeout(roomTimer);if(!roomSession)return;
+   const playing=roomState?.phase==='play';
+-  const delay=playing?(queuedMoves?32:65):roomState?.phase==='end'?1100:700;
++  const delay=playing?(roomState?.timedInputs?40:queuedMoves?32:65):roomState?.phase==='end'?1100:700;
+   roomTimer=setTimeout(()=>serverQueue(async()=>{
+     const current=roomSession;if(!current)return;
+-    const actions=pending;pending={bomb:false,needle:false};
+-    const attempt=current.pendingPacket||{round:roomState?.round,seq:++seq,direction:roomDir(),moveStart,moves:queuedMoves,...actions};
+-    if(current.pendingPacket){pending.bomb||=actions.bomb;pending.needle||=actions.needle}
++    const timedInputs=roomState?.timedInputs;
++    let attempt;
++    if(timedInputs){
++      attempt={round:roomState.round,moveStart,frames:queuedMoves};
++    }else{
++      const actions=pending;
++      pending={bomb:false,needle:false};
++      attempt=current.pendingPacket||{round:roomState?.round,seq:++seq,direction:roomDir(),moveStart,moves:queuedMoves,...actions};
++      if(current.pendingPacket){pending.bomb||=actions.bomb;pending.needle||=actions.needle}
++    }
+     try{
+       const r=await post('/api/rooms/'+current.code+'/sync',current.token,attempt);
+       if(roomSession!==current)return;delete current.pendingPacket;present(r);
+     }catch(e){
+       if(roomSession!==current)return;
+       if(e.status===403||e.status===404){localLobby();openRoomForm(false,e.message);return}
+-      current.pendingPacket=attempt;
++      if(!timedInputs)current.pendingPacket=attempt;
+       if(match.online&&roomState?.phase==='play')match.notice('다시 연결 중…');else message('연결을 다시 확인하는 중이야.');
+     }finally{if(roomSession===current)scheduleSync()}
+   }),delay);
+@@ -119,7 +148,7 @@ function scheduleSync(){
+ async function enterRoom(kind,code,token){
+   if(roomSession)return;
+   const path=kind==='join'?'/api/rooms/'+code+'/join':'/api/rooms/'+kind;
+-  const r=await post(path,token,{choices:match.choices});roomSession={code:r.code,token};rememberRoom();present(r);scheduleSync();
++  const r=await post(path,token,{choices:match.choices,inputVersion:2});roomSession={code:r.code,token};rememberRoom();present(r);scheduleSync();
+ }
+ function openRoomForm(join,msg=''){
+   $('roomTitle').textContent=join?'방 들어가기':'친구 대결';$('roomPanel').hidden=true;$('joinForm').hidden=!join;
+PATCH
